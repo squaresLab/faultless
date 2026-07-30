@@ -1,0 +1,12 @@
+[project]
+name = "faultless"
+version = "0.1.0"
+description = "A library for equivalence checking focused on neural decompilers."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "tree-sitter==0.23.1",
+    "tree-sitter-c==0.23.1",
+    "tree-sitter-python==0.21.0",
+    "z3-solver>=4.15.1.0",
+]
