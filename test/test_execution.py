@@ -6,7 +6,7 @@ import z3
 from .utils import TestValues
 
 from faultless import execute, EquivalenceOptions
-from faultless.ir import Value, AddressableValue, CompoundValue, z3repr, z3repr_options, IntegerConstant, Void, Pointer, Struct, UDT, Field, Integer, SymbolicExpression, SIZE_T
+from faultless.ir import Value, AddressableValue, CompoundValue, ExecutionError, z3repr, z3repr_options, IntegerConstant, Void, Pointer, Struct, UDT, Field, Integer, SymbolicExpression, SIZE_T
 from faultless.c import PRIMITIVE_TYPES
 
 _float = PRIMITIVE_TYPES["float"]
@@ -466,6 +466,35 @@ class TestReturnValuesEqual(TestValues):
 
         code = """int bar(int *x) { foo(x); return x[0]; }"""
         self.assertReturnBehaviorEquivalent(code, Value.make((_int, "\\param0[0]")), options=EquivalenceOptions(use_pass_by_reference_symvars=False))
+
+    def test_dereference_of_integer_address_base(self):
+        pointer_width = {
+            "long f(void) { return *(long *)(get_base() + 8); }": "get_base()[8]",
+            "long f(long a) { return *(long *)(a + 8); }": "\\param0[8]",
+            "long f(long *p) { return *(long *)((unsigned long)p + 8); }": "\\param0[8]",
+        }
+        narrow = {
+            "int get_base(void); long f(void) { return *(long *)(get_base() + 8); }": "get_base()[8]",
+            "long f(unsigned a) { return *(long *)(a - 8); }": "\\param0[-8]",
+        }
+        for integer_repr, reads in (("bitvec", pointer_width), ("int", pointer_width | narrow)):
+            with z3repr_options(integer_repr=integer_repr):
+                for code, read in reads.items():
+                    with self.subTest(code=code, integer_repr=integer_repr):
+                        self.assertReturnBehaviorEquivalent(code, Value.make((_long, read)))
+
+    def test_dereference_rejects_offsets_that_may_wrap_below_pointer_width(self):
+        for code in (
+            "int get_base(void); long f(void) { return *(long *)(get_base() + 8); }",
+            "long f(unsigned a) { return *(long *)(a + 8); }",
+            "long f(int a) { return *(long *)((long)(a + 8)); }",
+            "long f(long a) { return *(long *)(int)(a + 8); }",
+        ):
+            with self.subTest(code=code):
+                self.assertRaisesRegex(ExecutionError, "offset may have wrapped", execute, code)
+
+    def test_dereference_of_resigned_pointer_width_address_base(self):
+        self.assertReturnBehaviorEquivalent("long f(long a) { return *(long *)(unsigned long)(a + 8); }", Value.make((_long, "\\param0[8]")))
 
     def test_assignable_literal_zero_value(self):
         code = """void * getnull(int x, void * p) { if (x) return p; return 0LL; }"""

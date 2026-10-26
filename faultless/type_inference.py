@@ -1615,9 +1615,10 @@ def _collect_pointer_cast_byte_base_constraints(
 ) -> None:
     """Recognize ``(T *)(base + byte_offset)`` as address-base evidence.
 
-    Hex-Rays often emits byte-address arithmetic against an untyped global,
-    then casts the result to the final pointer type before dereferencing.  The
-    expression before the cast is not C pointer arithmetic, so the base should
+    Hex-Rays often emits byte-address arithmetic against an untyped global or
+    the result of an undeclared call, then casts the result to the final
+    pointer type before dereferencing.  The expression before the cast is not
+    C pointer arithmetic, so the base should
     be modeled as ``void *`` rather than ``T *``; otherwise Faultless would
     scale the explicit byte offset a second time.
     """
@@ -1661,8 +1662,18 @@ def _producer_instruction(function: Function[VarInstruction], variable: Variable
     return None
 
 
+def _is_unknown_call_result(function: Function[VarInstruction], operand: Variable) -> bool:
+    producer = _producer_instruction(function, operand) if operand.is_temporary else None
+    if producer is None or not isinstance(producer.op, FunctionCall) or producer.op.ftype is not None:
+        return False
+    return _known_function_type_for_call(producer.op) is None and not (
+        isinstance(producer.op.fname, str) and producer.op.fname in _KNOWN_FUNCTION_TYPES
+    )
+
+
 def _is_unknown_external_base(function: Function[VarInstruction], operand: Variable) -> bool:
-    if not isinstance(operand, GlobalVariable) or not isinstance(operand.type, UnknownType):
+    unknown_global = isinstance(operand, GlobalVariable) and isinstance(operand.type, UnknownType)
+    if not unknown_global and not _is_unknown_call_result(function, operand):
         return False
 
     for bb in function:

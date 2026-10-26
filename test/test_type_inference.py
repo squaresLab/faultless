@@ -444,7 +444,11 @@ class TestExternalTypeInference(unittest.TestCase):
 
         globals = self.globals_by_name(fn)
         self.assertEqual(globals["pmm_memory_map"].type, Pointer(Void()))
- 
+
+    def test_pointer_cast_of_call_result_byte_offset_infers_void_pointer_return(self):
+        fn = self.infer_external("""long bar(void) { return *(long *)(get_base() + 8); }""")
+        self.assertEqual(self.callee_types_by_name(fn)["get_base"], FunctionType(Pointer(Void()), []))
+
 
 if __name__ == "__main__":
     unittest.main()

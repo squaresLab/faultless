@@ -235,7 +235,59 @@ class TestEquivalenceChecking(unittest.TestCase):
         with z3repr_options(integer_repr="int"):
             self.assertTrue(are_equivalent(original, decompright, equivalence_options=EquivalenceOptions(memory_formatting_from_index=0)))
             self.assertFalse(are_equivalent(original, decompwrong, equivalence_options=EquivalenceOptions(memory_formatting_from_index=0)))
-    
+
+    def test_integer_to_pointer_casts_ignore_signedness_at_pointer_width(self):
+        self.assertTrue(are_equivalent("long f(long a) { return *(long *)(a + 8); }", "long f(long a) { return *(long *)((unsigned long)a + 8); }"))
+        self.assertTrue(are_equivalent("void *f(void) { return (void *)-1L; }", "void *f(void) { return (void *)0xffffffffffffffffUL; }"))
+        self.assertFalse(are_equivalent("void *f(void) { return (void *)-1L; }", "void *f(void) { return (void *)1L; }"))
+
+    def test_negative_pointer_arithmetic_index(self):
+        self.assertTrue(are_equivalent("int *f(int *p) { return p - (-1); }", "int *f(int *p) { return p + 1; }"))
+        self.assertTrue(are_equivalent("int f(int *p) { return p[-1]; }", "int f(int *p) { return *(p - 1); }"))
+        self.assertFalse(are_equivalent("int f(int *p) { return p[-1]; }", "int f(int *p) { return p[1]; }"))
+
+    def test_byte_offset_from_untyped_call_result(self):
+        # demmys/desk search_function: the decompiled address base is the result of an undeclared call.
+        types = """
+        struct Statement { int type; }; struct FunctionPattern_tag { int pattern; }; struct Storage { int size; };
+        struct FunctionDefinition_tag { char *name; char *descriptor; char *parameter_name; struct Statement *statement; struct FunctionPattern_tag *pattern_list; struct FunctionDefinition_tag *prev; struct FunctionDefinition_tag *next; };
+        struct Compiler { int function_count; struct FunctionDefinition_tag *function_list; int current_line_number; char *source_file; struct Storage *compile_storage; };
+        typedef struct Compiler Compiler;
+        typedef struct FunctionDefinition_tag FunctionDefinition;
+        """
+        original = types + """
+        static FunctionDefinition *search_function(char *identifier) {
+            Compiler *compiler;
+            FunctionDefinition *fd;
+            compiler = get_current_compiler();
+            for (fd = compiler->function_list; fd; fd = fd->next) {
+                if (!strcmp(fd->name, identifier)) {
+                    return fd;
+                }
+            }
+            return ((void *)0);
+        }
+        """
+        decompiled = """
+        typedef long long __int64; typedef unsigned long _QWORD;
+        __int64 search_function(char *s2) {
+            __int64 i;
+            for (i = *(_QWORD *)(get_current_compiler() + 8); i; i = *(_QWORD *)(i + 48)) {
+                if (!strcmp(*(const char **)i, s2))
+                    break;
+            }
+            return i;
+        }
+        """
+        wrong_next_offset = decompiled.replace("(i + 48)", "(i + 40)")
+        always_null = decompiled.replace("return i;", "return 0LL;")
+
+        are_equivalent(original, decompiled) # previously crashed with a z3 sort mismatch.
+        with z3repr_options(integer_repr="int"):
+            self.assertTrue(are_equivalent(original, decompiled))
+            self.assertFalse(are_equivalent(original, wrong_next_offset))
+            self.assertFalse(are_equivalent(original, always_null))
+
     def test_stack_initialier_function_inference(self):
         myread = """int myread() { int x; scanf("%d", &x); return x; }"""
         readint = """int readint() { int val; scanf("%d", &val); return val; }"""
