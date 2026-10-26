@@ -1089,36 +1089,118 @@ class Value:
             return AddressableValue(t, symrepr, Symbol(t, name, symrepr, False), ())
 
 
+def _decay(t: CType) -> CType:
+    return Pointer(t.element_type) if isinstance(t, Array) else t
+
+def _resize_displacement(offset: SymbolicExpression, sort: z3.SortRef) -> SymbolicExpression:
+    """Convert an address displacement to another representation, reading it as a signed (ptrdiff_t-like) quantity."""
+    match (z3.is_bv(offset), isinstance(sort, z3.BitVecSortRef)):
+        case (True, True):
+            return _bitvec_resize(offset, offset.size(), sort.size(), True) # type: ignore
+        case (True, False):
+            return z3.BV2Int(offset, is_signed=True)
+        case (False, True):
+            return z3.Int2BV(offset, sort.size()) # type: ignore
+        case _:
+            return offset
+
+# (expr, offset) such that the AddressableValue's offset is offset + (value.expr - expr).
+OffsetAnchor = tuple[SymbolicExpression, SymbolicExpression]
+
 AddressT = TypeVar("AddressT", Symbol, Variable, RODataAddress)
 class AddressableValue(Value,Generic[AddressT]):
-    def __init__(self, type: CType, expr: SymbolicExpression, base_address: AddressT, fields: tuple[Field,...]):
+    """A value of the form base_address + offset.
+
+    The offset is normally recovered by subtracting the base address (viewed at this value's type) from expr. A cast that
+    changes the z3 representation (e.g., a bitvector integer to a mathematical-integer pointer) wraps the whole sum and
+    cannot be cancelled syntactically, so such casts record an anchor carrying the converted offset instead. The anchor
+    assumes address arithmetic does not wrap; expr itself is kept exact. When the offset is unrecoverable, anchor holds
+    the error to raise on dereference.
+    """
+    def __init__(self, type: CType, expr: SymbolicExpression, base_address: AddressT, fields: tuple[Field,...], anchor: OffsetAnchor | ExecutionError | None = None):
         super().__init__(type, expr)
         self.base_address = base_address
         self.fields = fields
+        self.anchor = anchor
+
+    def derive(self, type: CType, expr: SymbolicExpression, fields: tuple[Field,...] | None = None) -> "AddressableValue[AddressT]":
+        return AddressableValue(type, expr, self.base_address, self.fields if fields is None else fields, self.anchor)
 
     def combine(self, other: Value, expr: SymbolicExpression, expr_t: CType, prefer_addressability: bool = False) -> Value:
         if isinstance(other, AddressableValue) and not prefer_addressability:
             return Value(expr_t, expr)
         if isinstance(other, CompoundValue):
             return other.combine(self, expr, expr_t, prefer_addressability) # will raise an error
-        return AddressableValue(expr_t, expr, base_address=self.base_address, fields=self.fields)           
+        return self.derive(expr_t, expr)
 
     def cast(self, new_type) -> "AddressableValue[AddressT]":
         if self.type == new_type:
             return self
-        else:
-            return AddressableValue(new_type, cast(self.expr, self.type, new_type), self.base_address, self.fields)
-    
+        expr = cast(self.expr, self.type, new_type)
+        if expr.eq(self.expr):
+            return self.derive(new_type, expr)
+        return AddressableValue(new_type, expr, self.base_address, self.fields, self._reanchor(new_type, expr))
+
+    def _reanchor(self, new_type: CType, expr: SymbolicExpression) -> OffsetAnchor | ExecutionError:
+        if not all(isinstance(t, (Integer, Pointer, Array)) for t in (self.type, new_type)):
+            return ExecutionError(f"{self} cast to {new_type} is not an address.")
+        if self._may_wrap_below_pointer_width(new_type):
+            # base + offset may have wrapped at the narrow width, so the widened address need not equal widened base + offset.
+            return ExecutionError(f"Casting {self} to {new_type} widens an address computed in a {self.type} narrower than a pointer, where its offset may have wrapped.")
+        try:
+            offset = self.compute_offset()
+        except ExecutionError as error:
+            return error
+        if not self._same_base_address(cast(self.base_view(self.type), self.type, new_type), self.base_view(new_type)):
+            return ExecutionError(f"Casting {self} to {new_type} changes the value of its base address {self.base_address.name}.")
+        return (expr, _resize_displacement(offset, expr.sort()))
+
+    def _may_wrap_below_pointer_width(self, new_type: CType) -> bool:
+        if not isinstance(self.type, Integer) or self.type.size >= SIZE_T.size:
+            return False
+        return (SIZE_T.size if isinstance(new_type, (Pointer, Array)) else new_type.size) > self.type.size # type: ignore
+
+    def _same_base_address(self, lhs: SymbolicExpression, rhs: SymbolicExpression) -> bool:
+        if z3.simplify(lhs).eq(z3.simplify(rhs)):
+            return True
+        solver = z3.Solver()
+        if isinstance(_decay(self.base_type), Pointer) and z3.is_int(self.base_symbol):
+            solver.add(0 <= self.base_symbol, self.base_symbol < 2 ** _pointer_bitwidth())
+        solver.add(lhs != rhs)
+        return solver.check() == z3.unsat
+
+    @property
+    def base_symbol(self) -> SymbolicExpression:
+        return self.base_address.symvar if isinstance(self.base_address, (Symbol, RODataAddress)) else z3repr(self.base_address)
+
+    @property
+    def base_type(self) -> CType:
+        return Pointer(self.base_address.type) if isinstance(self.base_address, Variable) else self.base_address.type
+
+    def base_view(self, t: CType) -> SymbolicExpression:
+        """The base address converted to type t, i.e., this value's expr when its offset is zero."""
+        return cast(self.base_symbol, self.base_type, _decay(t))
+
     def substitute(self, mapping: list[tuple[SymbolicExpression, SymbolicExpression]]) -> "AddressableValue[AddressT]":
-        return AddressableValue(self.type, substitute_z3_expr(self.expr, mapping), self.base_address, self.fields)
-     
+        anchor = tuple(substitute_z3_expr(e, mapping) for e in self.anchor) if isinstance(self.anchor, tuple) else self.anchor
+        return AddressableValue(self.type, substitute_z3_expr(self.expr, mapping), self.base_address, self.fields, anchor) # type: ignore
+
     def compute_offset(self) -> SymbolicExpression:
         """AddressableValues represent a base_address + some offset relative to the base address. This function
         returns just the relative offset without the base address.
         """
-        base_symbol = self.base_address.symvar if isinstance(self.base_address, (Symbol, RODataAddress)) else z3repr(self.base_address)
-        offset: SymbolicExpression = z3.simplify(self.expr - base_symbol) # type: ignore
-        if z3_contains_variable(base_symbol, offset):
+        match self.anchor:
+            case ExecutionError() as error:
+                raise error
+            case (anchor_expr, anchor_offset): ...
+            case None:
+                anchor_expr = self.base_symbol if self.base_symbol.sort() == self.expr.sort() else self.base_view(self.type)
+                anchor_offset = None
+        if self.expr.sort() != anchor_expr.sort():
+            raise ExecutionError(f"Could not remove base address from AddressableValue {self}: its representation differs from that of {anchor_expr}.")
+        difference = self.expr - anchor_expr
+        offset: SymbolicExpression = z3.simplify(difference if anchor_offset is None else anchor_offset + difference) # type: ignore
+        if z3_contains_variable(self.base_symbol, offset):
             raise ExecutionError(f"Could not remove base address from AddressableValue {self}: {offset}")
         return offset
         
@@ -2948,6 +3030,15 @@ def resolve_to_compatible_z3_repr(lhs_t: CType, rhs_t: CType) -> CType | bool:
                     return arithmetic_type_conversion(lhs_t, rhs_t)
     return False
     
+def pointer_index(expr: SymbolicExpression, from_type: Integer) -> SymbolicExpression:
+    """Convert an integer to the pointer representation preserving its signed value, as for an index in pointer arithmetic.
+
+    Unlike an integer-to-pointer cast, which produces an address, a negative index must stay negative.
+    """
+    if Z3_REPR_OPTIONS.integer_repr == "bitvec" and Z3_REPR_OPTIONS.pointer_repr == "int":
+        return z3.BV2Int(expr, is_signed=isinstance(from_type, SignedInteger))
+    return cast(expr, from_type, Pointer(Void()))
+
 def cast(expr: SymbolicExpression, from_type: CType, to_type: CType) -> SymbolicExpression:
     if from_type == to_type:
         return expr
@@ -2955,7 +3046,9 @@ def cast(expr: SymbolicExpression, from_type: CType, to_type: CType) -> Symbolic
         assert isinstance(from_type, SignedInteger) or isinstance(from_type, UnsignedInteger), f"All concrete integer instances must be SignedIntegers or UnsignedIntegers but found {type(from_type)}."
         if isinstance(to_type, Pointer):
             if Z3_REPR_OPTIONS.integer_repr == "bitvec" and Z3_REPR_OPTIONS.pointer_repr == "int":
-                return z3.BV2Int(expr, is_signed=isinstance(from_type, SignedInteger))
+                # Extend per the integer's signedness, then read the bits as an address, as in the bitvec pointer representation.
+                assert isinstance(expr, z3.BitVecRef)
+                return z3.BV2Int(_bitvec_resize(expr, from_type.size * 8, _pointer_bitwidth(), isinstance(from_type, SignedInteger)), is_signed=False)
             if Z3_REPR_OPTIONS.integer_repr == "int" and Z3_REPR_OPTIONS.pointer_repr == "bitvec":
                 return z3.Int2BV(expr, _pointer_bitwidth())
             if Z3_REPR_OPTIONS.integer_repr == "bitvec" and Z3_REPR_OPTIONS.pointer_repr == "bitvec":
@@ -3099,7 +3192,7 @@ class Addition(Infix):
                 tgt_type_size = 1
             else:
                 raise ExecutionError(f"Cannot get size for non-object type {ptr.type.target_type} for pointer arithmetic.")
-            outexpr = ptr.expr + tgt_type_size * cast(update.expr, update.type, ptr.type)
+            outexpr = ptr.expr + tgt_type_size * pointer_index(update.expr, update.type)
             return ptr.combine(r, outexpr, resolved, True)
         elif isinstance(resolved, PrimitiveType):
             # This is an assert and not a SemanticError because this should be true after type inference/checking.
@@ -3159,7 +3252,7 @@ class Subtraction(Infix):
             assert isinstance(l.type, Pointer) and isinstance(r.type, Integer) # should have been checked by infer_type
             
             tgt_type_size = self._pointer_target_size(l.type)
-            outexpr = l.expr - tgt_type_size * cast(r.expr, r.type, l.type)
+            outexpr = l.expr - tgt_type_size * pointer_index(r.expr, r.type)
             return l.combine(r, outexpr, resolved, True)
         else:
             assert isinstance(l.type, PrimitiveType) and isinstance(r.type, PrimitiveType)
@@ -3482,7 +3575,7 @@ class Cast(ExpressionOperation):
         assert isinstance(t, CType)
         assert isinstance(v, Value)
         if isinstance(v, AddressableValue):
-            return AddressableValue(t, cast(v.expr, v.type, t), v.base_address, v.fields)
+            return v.cast(t)
         else:
             assert type(v) is Value or type(v) is ConditionalValue
             return Value(t, cast(v.expr, v.type, t))
@@ -3677,13 +3770,13 @@ class Subscript(ExpressionOperation, MemoryOperation):
         if not isinstance(read_t, ObjectType):
             raise ExecutionError(f"Cannot read value with non-object type {read_t}")
         read_size = read_t.get_size()
-        member_expr = read_size * cast(index.expr, index.type, Pointer(index.type))
+        member_expr = read_size * pointer_index(index.expr, index.type)
         offset = Offset(base.compute_offset() + member_expr, condition, read_size)
         if isinstance(base.base_address, Symbol):
             read_value = heap.read(base.base_address, offset, read_t)
         else:
             read_value = stack.read(base.base_address, offset, read_t)
-        base = AddressableValue(base.type, base.expr + member_expr, base.base_address, base.fields)
+        base = base.derive(base.type, base.expr + member_expr)
         return base, read_value
 
 class MemberAccess(ExpressionOperation, MemoryOperation):
@@ -3761,8 +3854,8 @@ class MemberAccess(ExpressionOperation, MemoryOperation):
         # When accessed, array struct members decay into pointers to their element types when used in an rvalue context.
         # We don't actually need to read the whole array directly.
         if isinstance(read_t, Array):
-            read_addr = AddressableValue(read_t, base.expr + field_expr, base.base_address, fields)
-            decayed = AddressableValue(Pointer(read_t.element_type), base.expr + field_expr, base.base_address, fields)
+            read_addr = base.derive(read_t, base.expr + field_expr, fields)
+            decayed = base.derive(Pointer(read_t.element_type), base.expr + field_expr, fields)
             return read_addr, decayed
         
         if isinstance(base.base_address, Symbol):
@@ -3770,7 +3863,7 @@ class MemberAccess(ExpressionOperation, MemoryOperation):
         else:
             read_val = stack.read(base.base_address, offset, read_t)
         
-        read_addr = AddressableValue(Pointer(read_t), base.expr + field_expr, base.base_address, fields)
+        read_addr = base.derive(Pointer(read_t), base.expr + field_expr, fields)
         return read_addr, read_val
         
 class FunctionCall(ExpressionOperation):

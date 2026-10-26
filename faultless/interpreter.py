@@ -304,11 +304,13 @@ class Execution:
             if op.loop_base_case is not None:
                 current_value = stack.read(op.variable, Offset(0, preexit_condition, op.type.get_size()), op.type)
                 if isinstance(current_value, AddressableValue):
+                    substituted = current_value.substitute(mapping)
                     current_value = AddressableValue(
-                        current_value.type, 
-                        substitute_z3_expr(current_value.expr, mapping),
+                        substituted.type,
+                        substituted.expr,
                         op.postloop_value.base_address, # the base address is for the postloop symvar
-                        current_value.fields
+                        substituted.fields,
+                        substituted.anchor
                     )
                 elif isinstance(current_value, ConditionalValue):
                     current_value = ConditionalValue(condition=substitute_z3_expr(current_value.condition, mapping))
@@ -479,8 +481,7 @@ class Execution:
                        isinstance(arguments[0].type, Pointer) and arguments[0].type.target_type == char_type, f"Base address for a string literal should be a {char_type} [] or {char_type} * but found {arguments[0]}"
                 index = arguments[0].compute_offset()
                 if isinstance(instruction.op, Subscript):
-                    char_ptr_type = Pointer(char_type)
-                    index = index + char_type.get_size() * arguments[1].cast(char_ptr_type).expr
+                    index = index + char_type.get_size() * pointer_index(arguments[1].expr, arguments[1].type)
                 # It is important that we set the value of result_value on each execution path.
                 result_value = self.rodata.read(arguments[0].base_address, Offset(index, condition, char_type.get_size()), char_type)
                 self.registers[instruction] = result_value
